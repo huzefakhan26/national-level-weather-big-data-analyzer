@@ -8,12 +8,14 @@ to prevent FastAPI from matching "stats" / "map" as a path parameter.
 
 from __future__ import annotations
 
+import asyncio
 import math
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from dependencies import get_db
@@ -50,6 +52,8 @@ class EventListItem(BaseModel):
     source_count: int = 1
     report_count: int = 1
     created_at: str
+    spark_processed_at: Optional[str] = None
+    db_written_at: Optional[str] = None
 
 
 class EventListResponse(BaseModel):
@@ -126,6 +130,8 @@ class EventDetailResponse(BaseModel):
     report_count: int = 1
     created_at: str
     updated_at: str
+    spark_processed_at: Optional[str] = None
+    db_written_at: Optional[str] = None
 
 
 class StatsResponse(BaseModel):
@@ -285,7 +291,8 @@ async def list_events(
                            credibility_score,
                            verification_status, verification_reasons, cluster_id,
                            source_count, report_count,
-                           first_seen, last_seen, created_at
+                           first_seen, last_seen, created_at,
+                           spark_processed_at, db_written_at
                     FROM canonical_events WHERE {where}
                     ORDER BY {sort_by} {sort_dir}
                     LIMIT %s OFFSET %s
@@ -312,6 +319,8 @@ async def list_events(
                         report_count=r[17] or 1,
                         event_timestamp=_dt_to_iso(r[18]),
                         created_at=_dt_to_iso(r[20]),
+                        spark_processed_at=_dt_to_iso(r[21]) if len(r) > 21 and r[21] else None,
+                        db_written_at=_dt_to_iso(r[22]) if len(r) > 22 and r[22] else None,
                     )
                     for r in rows
                 ]
@@ -462,6 +471,85 @@ async def get_map_events(
 # ── GET /events/{event_id} (AFTER /stats and /map) ───────────────
 
 
+# ── GET /events/stream (SSE — BEFORE /{event_id}) ─────────────────
+
+@router.get("/events/stream")
+async def stream_events(request: Request):
+    """
+    Server-Sent Events (SSE) endpoint streaming newly created or written events.
+    Yields events in SSE format: data: {json}\n\n
+    """
+    async def event_generator():
+        # Start checking from 10 seconds ago to catch immediately arriving events
+        last_check = datetime.now(timezone.utc) - timedelta(seconds=10)
+        while True:
+            if await request.is_disconnected():
+                break
+
+            current_check = datetime.now(timezone.utc)
+            try:
+                with get_db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT canonical_event_id, event_category, severity,
+                                   description, city, state, country, district,
+                                   latitude, longitude,
+                                   classified_category, classification_confidence,
+                                   credibility_score,
+                                   verification_status, verification_reasons, cluster_id,
+                                   source_count, report_count,
+                                   first_seen, last_seen, created_at,
+                                   spark_processed_at, db_written_at
+                            FROM canonical_events
+                            WHERE created_at > %s
+                               OR (db_written_at IS NOT NULL AND db_written_at > %s)
+                            ORDER BY created_at ASC
+                            LIMIT 50
+                        """, (last_check, last_check))
+                        rows = cur.fetchall()
+
+                        for r in rows:
+                            item = EventListItem(
+                                event_id=str(r[0]),
+                                event_category=r[1],
+                                severity=r[2],
+                                description=r[3][:200] if r[3] else None,
+                                city=r[4], state=r[5], country=r[6] or "India",
+                                district=r[7],
+                                latitude=float(r[8]) if r[8] is not None else None,
+                                longitude=float(r[9]) if r[9] is not None else None,
+                                classified_category=r[10],
+                                classification_confidence=float(r[11]) if r[11] is not None else None,
+                                credibility_score=float(r[12]) if r[12] is not None else None,
+                                verification_status=r[13] or "pending",
+                                verification_reasons=r[14] or [],
+                                cluster_id=str(r[15]) if r[15] else None,
+                                source_count=r[16] or 1,
+                                report_count=r[17] or 1,
+                                event_timestamp=_dt_to_iso(r[18]),
+                                created_at=_dt_to_iso(r[20]),
+                                spark_processed_at=_dt_to_iso(r[21]) if len(r) > 21 and r[21] else None,
+                                db_written_at=_dt_to_iso(r[22]) if len(r) > 22 and r[22] else None,
+                            )
+                            yield f"data: {item.model_dump_json()}\n\n"
+            except Exception:
+                pass
+
+            last_check = current_check
+            yield ": ping\n\n"
+            await asyncio.sleep(2)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.get("/events/{event_id}", response_model=EventDetailResponse)
 async def get_event(event_id: str):
     """Retrieve a single canonical event by UUID with full detail."""
@@ -483,7 +571,8 @@ async def get_event(event_id: str):
                            credibility_score, credibility_reasons, cluster_id,
                            verification_status, verification_reasons,
                            verified_by, verification_timestamp,
-                           created_at, updated_at
+                           created_at, updated_at,
+                           spark_processed_at, db_written_at
                     FROM canonical_events WHERE canonical_event_id = %s
                 """, (event_id,))
                 row = cur.fetchone()
@@ -587,6 +676,8 @@ async def get_event(event_id: str):
                     report_count=row[13] or 1,
                     created_at=_dt_to_iso(row[24]),
                     updated_at=_dt_to_iso(row[25]),
+                    spark_processed_at=_dt_to_iso(row[26]) if len(row) > 26 and row[26] else None,
+                    db_written_at=_dt_to_iso(row[27]) if len(row) > 27 and row[27] else None,
                 )
     except HTTPException:
         raise

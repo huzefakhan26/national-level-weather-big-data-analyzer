@@ -70,7 +70,11 @@ CITIES = [
 ]
 
 # ── Open-Meteo API ──────────────────────────────────────────────────
-BASE_URL = "https://api.open-meteo.com/v1/forecast"
+BASE_API_URL = os.environ.get("OPEN_METEO_BASE_URL", "https://api.open-meteo.com/v1").rstrip("/")
+BASE_URL = f"{BASE_API_URL}/forecast"
+
+ARCHIVE_API_URL = os.environ.get("OPEN_METEO_ARCHIVE_URL", "https://archive-api.open-meteo.com/v1").rstrip("/")
+ARCHIVE_URL = f"{ARCHIVE_API_URL}/archive"
 
 # Current weather variables needed for the canonical event
 CURRENT_WEATHER_PARAMS = [
@@ -81,6 +85,41 @@ CURRENT_WEATHER_PARAMS = [
     "wind_speed_10m",
     "wind_direction_10m",
 ]
+
+
+def fetch_archive_weather(
+    latitude: float,
+    longitude: float,
+    start_date: str,
+    end_date: str,
+    timeout: int = 15,
+) -> dict | None:
+    """
+    Query historical weather observations from Open-Meteo Archive API.
+
+    IMPORTANT ARCHITECTURAL NOTE:
+    Historical weather data from the archive API represents past events.
+    It MUST NOT be emitted directly to the live streaming Kafka topic 'weather.raw'
+    because Spark Structured Streaming enforces a 30-minute watermark on
+    'event_time', which drops older events as late data. This utility is
+    integrated for batch analytics, backfill, and historical model evaluation.
+    """
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "start_date": start_date,
+        "end_date": end_date,
+        "hourly": ["temperature_2m", "precipitation", "weather_code", "wind_speed_10m"],
+    }
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.get(ARCHIVE_URL, params=params)
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as exc:
+        logger.warning("Open-Meteo Archive fetch failed for (%s, %s): %s", latitude, longitude, exc)
+        return None
+
 
 
 class OpenMeteoAdapter:

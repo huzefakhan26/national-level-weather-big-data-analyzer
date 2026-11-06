@@ -1114,16 +1114,13 @@ export default function GeospatialIntelligence() {
               zoomControl={true}
               attributionControl={false}
             >
+              {/* MapTiler Streets Base Tiles */}
               <TileLayer
-                url="https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png"
+                url={`https://api.maptiler.com/maps/streets-v2/{z}/{x}/{y}.png?key=${import.meta.env.VITE_MAPTILER_API_KEY}`}
                 maxZoom={19}
-                subdomains="abcd"
-              />
-              <TileLayer
-                url="https://{s}.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}{r}.png"
-                maxZoom={19}
-                subdomains="abcd"
-                opacity={0.7}
+                tileSize={512}
+                zoomOffset={-1}
+                attribution='&copy; <a href="https://www.maptiler.com/copyright/">MapTiler</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>'
               />
 
               {/* Surrounding countries landmass layer */}
